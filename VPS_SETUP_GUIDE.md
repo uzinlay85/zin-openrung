@@ -183,3 +183,185 @@ Point client apps (mobile/desktop/terminal) to your broker HTTPS URL. They disco
 - `deploy/relay/README.md`
 - `deploy/relayhub/README.md`
 - `docs/architecture.md`, `docs/wss-fallback.md`, `docs/api.md`
+---
+
+# OpenRung — ကိုယ်ပိုင် VPS မှာ Host လုပ်ခြင်း (အပြည့်အစုံ လမ်းညွှန်)
+
+ဒီလမ်းညွှန်သည် OpenRung ၏ broker + relay (နှင့် ရွေးချယ်နိုင်သော relay hub) ကို ကိုယ်ပိုင် VPS ပေါ်မှာ end-to-end တည်ဆောက်နည်းကို ရှင်းပြထားသည်။ repository ၏ `deploy/` manifest များအပေါ် အခြေခံထားသည်။
+
+## အကျဉ်းချုပ်
+
+- **Broker** = control plane (relay directory, registration, heartbeat, telemetry)။ traffic နည်း → ဘယ် VPS မှာမဆို run နိုင်။
+- **Relay** = data plane (Xray VLESS+REALITY+Vision) public IP ပေါ်တွင် run။ TCP/443 ဖွင့်ရန်လို။
+- **Relay Hub** (ရွေးချယ်နိုင်) = CGNAT volunteer relay များအတွက် tunnel။ bandwidth စရိတ်သက်သာသောနေရာမှာသာ run ပါ။
+
+## လိုအပ်ချက်များ
+
+- public IP ရှိသော Linux VPS (Ubuntu 22.04+ အကြံပြု)။
+- Docker + Compose v2 တပ်ဆင်ထားရန်။
+- firewall/security group တွင် port များဖွင့်ထားရန်:
+  - Broker: TCP 8080 (သို့မဟုတ် Cloudflare/HTTPS ဖြင့် front)
+  - Relay: TCP 443 (မဖြစ်မနေ); QUIC အတွက် UDP ရွေးချယ်နိုင်
+  - Hub (ရွေးချယ်နိုင်): TCP 9443, TCP 9444, UDP reflector, public port range
+- registration အတွက် ရှည်လျားသော random token။
+
+## 1. Docker တပ်ဆင်ခြင်း
+
+```sh
+curl -fsSL https://get.docker.com | sh
+sudo usermod -aG docker $USER
+newgrp docker
+docker compose version
+```
+
+## 2. Repository clone လုပ်ခြင်း
+
+```sh
+git clone https://github.com/uzinlay85/zin-openrung.git
+cd zin-openrung
+```
+
+## 3. Broker deploy လုပ်ခြင်း
+
+```sh
+cd deploy/broker
+install -m 0600 .env.example .env
+```
+
+`.env` ကို တည်းဖြတ်ပါ:
+
+```sh
+OPENRUNG_VOLUNTEER_TOKEN=<ရှည်လျားသော-random-secret>
+# သို့မဟုတ် anonymous ခွင့်ပြု:
+# OPENRUNG_ALLOW_ANONYMOUS_REGISTRATION=true
+
+OPENRUNG_RELAY_STORE=memory
+OPENRUNG_TELEMETRY_STORE=jsonl
+OPENRUNG_DASHBOARD_TOKEN=<ရွေးချယ်နိုင်>
+OPENRUNG_API_TOKEN=<ရွေးချယ်နိုင်>
+```
+
+စတင်ရန်:
+
+```sh
+docker compose up -d --build
+docker compose logs -f
+curl http://localhost:8080/healthz
+curl http://localhost:8080/api/v1/relays
+```
+
+Broker သည် `:8080` တွင် နားထောင်သည်။ relay/hub များကို `OPENRUNG_BROKER_URL=http://<vps-ip>:8080` ဖြင့် ညွှန်ပါ။
+
+### TLS (ရွေးချယ်နိုင်)
+
+Cloudflare သို့မဟုတ် reverse proxy ဖြင့် HTTPS front လုပ်ပါ။ client app များ၏ broker URL ကို Cloudflare hostname သို့ သတ်မှတ်ပါ။ `deploy/broker/Caddyfile` နှင့် `origin-tls.md` ကို ကြည့်ပါ။
+
+## 4. Relay deploy လုပ်ခြင်း
+
+```sh
+cd ../relay
+install -m 0600 .env.example .env
+```
+
+အနည်းဆုံး `.env`:
+
+```sh
+OPENRUNG_BROKER_URL=http://<broker-ip>:8080
+OPENRUNG_PUBLIC_HOST=<သင့်-public-ip-သို့-dns>
+OPENRUNG_VOLUNTEER_TOKEN=<broker-နှင့်တူ>
+```
+
+Foundation-operated (ရွေးချယ်နိုင်): `OPENRUNG_FOUNDATION_TOKEN` တစ်ခုသာ သတ်မှတ်ပါ (foundation class + direct mode ဖြစ်စေသည်)။ ၎င်းနှင့်အတူ `OPENRUNG_NODE_CLASS`/`OPENRUNG_MODE` မထည့်ပါနှင့်။
+
+စတင်ရန်:
+
+```sh
+docker compose up -d --build
+docker compose logs -f   # registered relay ... / heartbeat ok မျှော်လင့်ရ
+```
+
+Firewall: TCP 443 ကို world သို့ ဖွင့်ပါ။ relay သည် pinned Xray-core ပါဝင်သည်။
+
+### လည်ပတ်ခြင်း
+
+```sh
+docker compose logs -f
+docker compose restart
+docker compose down
+```
+
+Shutdown သည် graceful ဖြစ်သည် (SIGTERM)။
+
+### Xray-core အဆင့်မြှင့်ခြင်း
+
+Dockerfile နှင့် docker-compose.yml တွင် version ပြောင်းပြီး:
+
+```sh
+docker compose build --build-arg XRAY_VERSION=v26.3.27
+```
+
+## 5. (ရွေးချယ်နိုင်) CGNAT relay များအတွက် Relay Hub
+
+bandwidth စရိတ်သက်သာသော provider (Hetzner, OVH စသည်) တွင် run ပါ။
+
+```sh
+cd ../relayhub
+install -m 0600 .env.example .env
+mkdir -p certs   # hub.crt + hub.key ထည့်ပါ
+```
+
+အနည်းဆုံး `.env`:
+
+```sh
+OPENRUNG_HUB_PUBLIC_HOST=hub.example.com
+OPENRUNG_BROKER_URL=http://<broker-ip>:8080
+OPENRUNG_HUB_PORT_RANGE=...   # concurrent tunnel အရေအတွက်
+```
+
+စတင်ရန်:
+
+```sh
+docker compose up -d --build
+```
+
+CGNAT relay များကို ညွှန်ရန်:
+
+```sh
+OPENRUNG_TUNNEL=true
+OPENRUNG_HUB_ADDR=hub.example.com:9443
+OPENRUNG_VOLUNTEER_TOKEN=<တူညီသော token>
+```
+
+Firewall: control port, public port range, reflector UDP, punch coordinator TCP ဖွင့်ပါ။
+
+## 6. Client app များ
+
+mobile/desktop/terminal client app များကို သင့် broker HTTPS URL သို့ ညွှန်ပါ။ relay များကို broker မှ ရှာဖွေသည်။ အခြား config မလို။
+
+## 7. Persistence နှင့် အရန်ကူးယူခြင်း
+
+- Broker telemetry: `/var/lib/openrung/telemetry.jsonl` သို့မဟုတ် Postgres။
+- Relay identity: `.env` (registration creds + stable identity) ကို လုံခြုံစွာ သိမ်းပါ။
+- restart များတွင် တည်တံ့ရန် `OPENRUNG_RELAY_STORE=postgres` သုံးပါ။
+
+## 8. Security ဆိုင်ရာ သတိပေးချက်များ
+
+- `.env` ကို commit မလုပ်ပါနှင့်။
+- token သို့မဟုတ် anonymous opt-in မရှိပါက broker စတင်မည်မဟုတ်။
+- Foundation token သည် self-contained bearer ဖြစ်သည်; ကာကွယ်ပါ။
+- proxy နောက်တွင်ရှိပါက `OPENRUNG_TRUSTED_PROXY_CIDRS` သတ်မှတ်ပါ။
+
+## 9. ပြဿနာဖြေရှင်းခြင်း
+
+- `healthz` မအောင်မြင် → `docker compose logs` နှင့် port 8080 စစ်ပါ။
+- relay မ register ဖြစ် → broker URL ရောက်နိုင်မှု, token တူညီမှု, public host သတ်မှတ်ထားမှု စစ်ပါ။
+- client ချိတ်ဆက်မရ → TCP 443 ဖွင့်ထားမှု, public host မှန်ကန်မှု စစ်ပါ။
+- hub egress များ → ပုံမှန်ဖြစ်သည်; unmetered host သို့ ပြောင်းပါ။
+
+## ဆက်စပ် ကိုးကားချက်များ
+
+- `deploy/broker/README.md`
+- `deploy/relay/README.md`
+- `deploy/relayhub/README.md`
+- `docs/architecture.md`, `docs/wss-fallback.md`, `docs/api.md`
+
